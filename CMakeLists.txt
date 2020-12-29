@@ -1,26 +1,26 @@
 cmake_minimum_required(VERSION 3.15)
 
 include(CheckIncludeFileCXX)
+include(CheckIPOSupported)
 
 project(ninja)
 
 # --- optional link-time optimization
-if(CMAKE_BUILD_TYPE MATCHES "Release")
-	include(CheckIPOSupported)
-	check_ipo_supported(RESULT lto_supported OUTPUT error)
+check_ipo_supported(RESULT lto_supported OUTPUT error)
 
-	if(lto_supported)
-		message(STATUS "IPO / LTO enabled")
-		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-	else()
-		message(STATUS "IPO / LTO not supported: <${error}>")
-	endif()
+if(lto_supported)
+	message(STATUS "IPO / LTO enabled")
+	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+else()
+	message(STATUS "IPO / LTO not supported: <${error}>")
 endif()
 
 # --- compiler flags
 if(MSVC)
 	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-	string(APPEND CMAKE_CXX_FLAGS " /W4 /GR- /Zc:__cplusplus")
+	string(REPLACE "/GR" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+	string(APPEND CMAKE_CXX_FLAGS " /W4 /wd4100 /wd4267 /wd4706 /wd4702 /wd4244 /GR- /Zc:__cplusplus")
+	add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 else()
 	include(CheckCXXCompilerFlag)
 	check_cxx_compiler_flag(-Wno-deprecated flag_no_deprecated)
@@ -112,11 +112,25 @@ if(WIN32)
 	endif()
 else()
 	target_sources(libninja PRIVATE src/subprocess-posix.cc)
+	if(CMAKE_SYSTEM_NAME STREQUAL "OS400" OR CMAKE_SYSTEM_NAME STREQUAL "AIX")
+		target_sources(libninja PRIVATE src/getopt.c)
+	endif()
+
+	# Needed for perfstat_cpu_total
+	if(CMAKE_SYSTEM_NAME STREQUAL "AIX")
+		target_link_libraries(libninja PUBLIC "-lperfstat")
+	endif()
 endif()
 
 #Fixes GetActiveProcessorCount on MinGW
 if(MINGW)
 target_compile_definitions(libninja PRIVATE _WIN32_WINNT=0x0601 __USE_MINGW_ANSI_STDIO=1)
+endif()
+
+# On IBM i (identified as "OS400" for compatibility reasons) and AIX, this fixes missing
+# PRId64 (and others) at compile time in C++ sources
+if(CMAKE_SYSTEM_NAME STREQUAL "OS400" OR CMAKE_SYSTEM_NAME STREQUAL "AIX")
+	string(APPEND CMAKE_CXX_FLAGS " -D__STDC_FORMAT_MACROS")
 endif()
 
 # Main executable is library plus main() function.
@@ -131,7 +145,7 @@ if(platform_supports_ninja_browse)
 		OUTPUT build/browse_py.h
 		MAIN_DEPENDENCY src/browse.py
 		DEPENDS src/inline.sh
-		COMMAND cmake -E make_directory ${CMAKE_BINARY_DIR}/build
+		COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/build
 		COMMAND src/inline.sh kBrowsePy
 						< src/browse.py
 						> ${CMAKE_BINARY_DIR}/build/browse_py.h
@@ -189,7 +203,13 @@ if(BUILD_TESTING)
     target_link_libraries(${perftest} PRIVATE libninja libninja-re2c)
   endforeach()
 
-  add_test(NinjaTest ninja_test)
+  if(CMAKE_SYSTEM_NAME STREQUAL "AIX" AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # These tests require more memory than will fit in the standard AIX shared stack/heap (256M)
+    target_link_libraries(hash_collision_bench PRIVATE "-Wl,-bmaxdata:0x80000000")
+    target_link_libraries(manifest_parser_perftest PRIVATE "-Wl,-bmaxdata:0x80000000")
+  endif()
+
+  add_test(NAME NinjaTest COMMAND ninja_test)
 endif()
 
 install(TARGETS ninja DESTINATION bin)
