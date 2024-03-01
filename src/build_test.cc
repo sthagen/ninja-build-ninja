@@ -15,6 +15,8 @@
 #include "build.h"
 
 #include <assert.h>
+#include <climits>
+#include <stdint.h>
 
 #include "build_log.h"
 #include "deps_log.h"
@@ -50,6 +52,14 @@ struct PlanTest : public StateTestWithBuiltinRules {
     sort(ret->begin(), ret->end(), CompareEdgesByOutput::cmp);
   }
 
+  void PrepareForTarget(const char* node, BuildLog *log=NULL) {
+    string err;
+    EXPECT_TRUE(plan_.AddTarget(GetNode(node), &err));
+    ASSERT_EQ("", err);
+    plan_.PrepareQueue();
+    ASSERT_TRUE(plan_.more_to_do());
+  }
+
   void TestPoolWithDepthOne(const char *test_case);
 };
 
@@ -59,10 +69,7 @@ TEST_F(PlanTest, Basic) {
 "build mid: cat in\n"));
   GetNode("mid")->MarkDirty();
   GetNode("out")->MarkDirty();
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("out"), &err));
-  ASSERT_EQ("", err);
-  ASSERT_TRUE(plan_.more_to_do());
+  PrepareForTarget("out");
 
   Edge* edge = plan_.FindWork();
   ASSERT_TRUE(edge);
@@ -71,6 +78,7 @@ TEST_F(PlanTest, Basic) {
 
   ASSERT_FALSE(plan_.FindWork());
 
+  string err;
   plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
 
@@ -95,15 +103,12 @@ TEST_F(PlanTest, DoubleOutputDirect) {
   GetNode("mid1")->MarkDirty();
   GetNode("mid2")->MarkDirty();
   GetNode("out")->MarkDirty();
-
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("out"), &err));
-  ASSERT_EQ("", err);
-  ASSERT_TRUE(plan_.more_to_do());
+  PrepareForTarget("out");
 
   Edge* edge;
   edge = plan_.FindWork();
   ASSERT_TRUE(edge);  // cat in
+  string err;
   plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
 
@@ -128,14 +133,12 @@ TEST_F(PlanTest, DoubleOutputIndirect) {
   GetNode("b1")->MarkDirty();
   GetNode("b2")->MarkDirty();
   GetNode("out")->MarkDirty();
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("out"), &err));
-  ASSERT_EQ("", err);
-  ASSERT_TRUE(plan_.more_to_do());
+  PrepareForTarget("out");
 
   Edge* edge;
   edge = plan_.FindWork();
   ASSERT_TRUE(edge);  // cat in
+  string err;
   plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
 
@@ -169,15 +172,12 @@ TEST_F(PlanTest, DoubleDependent) {
   GetNode("a1")->MarkDirty();
   GetNode("a2")->MarkDirty();
   GetNode("out")->MarkDirty();
-
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("out"), &err));
-  ASSERT_EQ("", err);
-  ASSERT_TRUE(plan_.more_to_do());
+  PrepareForTarget("out");
 
   Edge* edge;
   edge = plan_.FindWork();
   ASSERT_TRUE(edge);  // cat in
+  string err;
   plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
 
@@ -209,6 +209,7 @@ void PlanTest::TestPoolWithDepthOne(const char* test_case) {
   ASSERT_EQ("", err);
   EXPECT_TRUE(plan_.AddTarget(GetNode("out2"), &err));
   ASSERT_EQ("", err);
+  plan_.PrepareQueue();
   ASSERT_TRUE(plan_.more_to_do());
 
   Edge* edge = plan_.FindWork();
@@ -284,10 +285,7 @@ TEST_F(PlanTest, PoolsWithDepthTwo) {
     GetNode("outb" + string(1, '1' + static_cast<char>(i)))->MarkDirty();
   }
   GetNode("allTheThings")->MarkDirty();
-
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("allTheThings"), &err));
-  ASSERT_EQ("", err);
+  PrepareForTarget("allTheThings");
 
   deque<Edge*> edges;
   FindWorkSorted(&edges, 5);
@@ -306,6 +304,7 @@ TEST_F(PlanTest, PoolsWithDepthTwo) {
   ASSERT_EQ("outb3", edge->outputs_[0]->path());
 
   // finish out1
+  string err;
   plan_.EdgeFinished(edges.front(), Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
   edges.pop_front();
@@ -363,10 +362,7 @@ TEST_F(PlanTest, PoolWithRedundantEdges) {
   GetNode("bar.cpp.obj")->MarkDirty();
   GetNode("libfoo.a")->MarkDirty();
   GetNode("all")->MarkDirty();
-  string err;
-  EXPECT_TRUE(plan_.AddTarget(GetNode("all"), &err));
-  ASSERT_EQ("", err);
-  ASSERT_TRUE(plan_.more_to_do());
+  PrepareForTarget("all");
 
   Edge* edge = NULL;
 
@@ -375,6 +371,7 @@ TEST_F(PlanTest, PoolWithRedundantEdges) {
 
   edge = initial_edges[1];  // Foo first
   ASSERT_EQ("foo.cpp", edge->outputs_[0]->path());
+  string err;
   plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err);
   ASSERT_EQ("", err);
 
@@ -439,6 +436,7 @@ TEST_F(PlanTest, PoolWithFailingEdge) {
   ASSERT_EQ("", err);
   EXPECT_TRUE(plan_.AddTarget(GetNode("out2"), &err));
   ASSERT_EQ("", err);
+  plan_.PrepareQueue();
   ASSERT_TRUE(plan_.more_to_do());
 
   Edge* edge = plan_.FindWork();
@@ -467,13 +465,63 @@ TEST_F(PlanTest, PoolWithFailingEdge) {
   ASSERT_EQ(0, edge);
 }
 
+TEST_F(PlanTest, PriorityWithoutBuildLog) {
+  // Without a build log, the critical time is equivalent to graph
+  // depth. Test with the following graph:
+  //   a2
+  //   |
+  //   a1  b1
+  //   |  |  |
+  //   a0 b0 c0
+  //    \ | /
+  //     out
+
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+    "rule r\n"
+    "  command = unused\n"
+    "build out: r a0 b0 c0\n"
+    "build a0: r a1\n"
+    "build a1: r a2\n"
+    "build b0: r b1\n"
+    "build c0: r b1\n"
+  ));
+  GetNode("a1")->MarkDirty();
+  GetNode("a0")->MarkDirty();
+  GetNode("b0")->MarkDirty();
+  GetNode("c0")->MarkDirty();
+  GetNode("out")->MarkDirty();
+  BuildLog log;
+  PrepareForTarget("out", &log);
+
+  EXPECT_EQ(GetNode("out")->in_edge()->critical_path_weight(), 1);
+  EXPECT_EQ(GetNode("a0")->in_edge()->critical_path_weight(), 2);
+  EXPECT_EQ(GetNode("b0")->in_edge()->critical_path_weight(), 2);
+  EXPECT_EQ(GetNode("c0")->in_edge()->critical_path_weight(), 2);
+  EXPECT_EQ(GetNode("a1")->in_edge()->critical_path_weight(), 3);
+
+  const int n_edges = 5;
+  const char *expected_order[n_edges] = {
+    "a1", "a0", "b0", "c0", "out"};
+  for (int i = 0; i < n_edges; ++i) {
+    Edge* edge = plan_.FindWork();
+    ASSERT_TRUE(edge != nullptr);
+    EXPECT_EQ(expected_order[i], edge->outputs_[0]->path());
+
+    std::string err;
+    ASSERT_TRUE(plan_.EdgeFinished(edge, Plan::kEdgeSucceeded, &err));
+    EXPECT_EQ(err, "");
+  }
+
+  EXPECT_FALSE(plan_.FindWork());
+}
+
 /// Fake implementation of CommandRunner, useful for tests.
 struct FakeCommandRunner : public CommandRunner {
   explicit FakeCommandRunner(VirtualFileSystem* fs) :
       max_active_edges_(1), fs_(fs) {}
 
   // CommandRunner impl
-  virtual bool CanRunMore() const;
+  virtual size_t CanRunMore() const;
   virtual bool StartCommand(Edge* edge);
   virtual bool WaitForCommand(Result* result);
   virtual vector<Edge*> GetActiveEdges();
@@ -574,8 +622,11 @@ void BuildTest::RebuildTarget(const string& target, const char* manifest,
   builder.command_runner_.release();
 }
 
-bool FakeCommandRunner::CanRunMore() const {
-  return active_edges_.size() < max_active_edges_;
+size_t FakeCommandRunner::CanRunMore() const {
+  if (active_edges_.size() < max_active_edges_)
+    return SIZE_MAX;
+
+  return 0;
 }
 
 bool FakeCommandRunner::StartCommand(Edge* edge) {

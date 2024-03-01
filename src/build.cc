@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <climits>
+#include <stdint.h>
 #include <functional>
 
 #if defined(__SVR4) && defined(__sun)
@@ -46,7 +48,7 @@ struct DryRunCommandRunner : public CommandRunner {
   virtual ~DryRunCommandRunner() {}
 
   // Overridden from CommandRunner:
-  virtual bool CanRunMore() const;
+  virtual size_t CanRunMore() const;
   virtual bool StartCommand(Edge* edge);
   virtual bool WaitForCommand(Result* result);
 
@@ -54,8 +56,8 @@ struct DryRunCommandRunner : public CommandRunner {
   queue<Edge*> finished_;
 };
 
-bool DryRunCommandRunner::CanRunMore() const {
-  return true;
+size_t DryRunCommandRunner::CanRunMore() const {
+  return SIZE_MAX;
 }
 
 bool DryRunCommandRunner::StartCommand(Edge* edge) {
@@ -89,6 +91,7 @@ void Plan::Reset() {
 }
 
 bool Plan::AddTarget(const Node* target, string* err) {
+  targets_.push_back(target);
   return AddSubTarget(target, NULL, err, NULL);
 }
 
@@ -128,8 +131,6 @@ bool Plan::AddSubTarget(const Node* node, const Node* dependent, string* err,
   if (node->dirty() && want == kWantNothing) {
     want = kWantToStart;
     EdgeWanted(edge);
-    if (!dyndep_walk && edge->AllInputsReady())
-      ScheduleWork(want_ins.first);
   }
 
   if (dyndep_walk)
@@ -156,10 +157,10 @@ void Plan::EdgeWanted(const Edge* edge) {
 Edge* Plan::FindWork() {
   if (ready_.empty())
     return NULL;
-  EdgeSet::iterator e = ready_.begin();
-  Edge* edge = *e;
-  ready_.erase(e);
-  return edge;
+
+  Edge* work = ready_.top();
+  ready_.pop();
+  return work;
 }
 
 void Plan::ScheduleWork(map<Edge*, Want>::iterator want_e) {
@@ -180,7 +181,7 @@ void Plan::ScheduleWork(map<Edge*, Want>::iterator want_e) {
     pool->RetrieveReadyEdges(&ready_);
   } else {
     pool->EdgeScheduled(*edge);
-    ready_.insert(edge);
+    ready_.push(edge);
   }
 }
 
@@ -442,6 +443,121 @@ void Plan::UnmarkDependents(const Node* node, set<Node*>* dependents) {
   }
 }
 
+namespace {
+
+template <typename T>
+struct SeenBefore {
+  std::set<const T*>* seen_;
+
+  SeenBefore(std::set<const T*>* seen) : seen_(seen) {}
+
+  bool operator() (const T* item) {
+    // Return true if the item has been seen before
+    return !seen_->insert(item).second;
+  }
+};
+
+// Heuristic for edge priority weighting.
+// Phony edges are free (0 cost), all other edges are weighted equally.
+int64_t EdgeWeightHeuristic(Edge *edge) {
+  return edge->is_phony() ? 0 : 1;
+}
+
+}  // namespace
+
+void Plan::ComputeCriticalPath() {
+  METRIC_RECORD("ComputeCriticalPath");
+  // Remove duplicate targets
+  {
+    std::set<const Node*> seen;
+    SeenBefore<Node> seen_before(&seen);
+    targets_.erase(std::remove_if(targets_.begin(), targets_.end(), seen_before),
+                   targets_.end());
+  }
+
+  // Use backflow algorithm to compute the critical path for all
+  // nodes, starting from the destination nodes.
+  // XXX: ignores pools
+  std::queue<Edge*> work_queue;        // Queue, for breadth-first traversal
+  // The set of edges currently in work_queue, to avoid duplicates.
+  std::set<const Edge*> active_edges;
+  SeenBefore<Edge> seen_edge(&active_edges);
+
+  for (size_t i = 0; i < targets_.size(); ++i) {
+    const Node* target = targets_[i];
+    if (Edge* in = target->in_edge()) {
+      int64_t edge_weight = EdgeWeightHeuristic(in);
+      in->set_critical_path_weight(
+          std::max<int64_t>(edge_weight, in->critical_path_weight()));
+      if (!seen_edge(in)) {
+        work_queue.push(in);
+      }
+    }
+  }
+
+  while (!work_queue.empty()) {
+    Edge* e = work_queue.front();
+    work_queue.pop();
+    // If the critical path of any dependent edges is updated, this
+    // edge may need to be processed again. So re-allow insertion.
+    active_edges.erase(e);
+
+    for (std::vector<Node*>::iterator it = e->inputs_.begin(),
+                                      end = e->inputs_.end();
+         it != end; ++it) {
+      Edge* in = (*it)->in_edge();
+      if (!in) {
+        continue;
+      }
+      // Only process edge if this node offers a higher weighted path
+      const int64_t edge_weight = EdgeWeightHeuristic(in);
+      const int64_t proposed_weight = e->critical_path_weight() + edge_weight;
+      if (proposed_weight > in->critical_path_weight()) {
+        in->set_critical_path_weight(proposed_weight);
+        if (!seen_edge(in)) {
+          work_queue.push(in);
+        }
+      }
+    }
+  }
+}
+
+void Plan::ScheduleInitialEdges() {
+  // Add ready edges to queue.
+  assert(ready_.empty());
+  std::set<Pool*> pools;
+
+  for (std::map<Edge*, Plan::Want>::iterator it = want_.begin(),
+           end = want_.end(); it != end; ++it) {
+    Edge* edge = it->first;
+    Plan::Want want = it->second;
+    if (!(want == kWantToStart && edge->AllInputsReady())) {
+      continue;
+    }
+
+    Pool* pool = edge->pool();
+    if (pool->ShouldDelayEdge()) {
+      pool->DelayEdge(edge);
+      pools.insert(pool);
+    } else {
+      ScheduleWork(it);
+    }
+  }
+
+  // Call RetrieveReadyEdges only once at the end so higher priority
+  // edges are retrieved first, not the ones that happen to be first
+  // in the want_ map.
+  for (std::set<Pool*>::iterator it=pools.begin(),
+           end = pools.end(); it != end; ++it) {
+    (*it)->RetrieveReadyEdges(&ready_);
+  }
+}
+
+void Plan::PrepareQueue() {
+  ComputeCriticalPath();
+  ScheduleInitialEdges();
+}
+
 void Plan::Dump() const {
   printf("pending: %d\n", (int)want_.size());
   for (map<Edge*, Want>::const_iterator e = want_.begin(); e != want_.end(); ++e) {
@@ -455,7 +571,7 @@ void Plan::Dump() const {
 struct RealCommandRunner : public CommandRunner {
   explicit RealCommandRunner(const BuildConfig& config) : config_(config) {}
   virtual ~RealCommandRunner() {}
-  virtual bool CanRunMore() const;
+  virtual size_t CanRunMore() const;
   virtual bool StartCommand(Edge* edge);
   virtual bool WaitForCommand(Result* result);
   virtual vector<Edge*> GetActiveEdges();
@@ -478,12 +594,26 @@ void RealCommandRunner::Abort() {
   subprocs_.Clear();
 }
 
-bool RealCommandRunner::CanRunMore() const {
+size_t RealCommandRunner::CanRunMore() const {
   size_t subproc_number =
       subprocs_.running_.size() + subprocs_.finished_.size();
-  return (int)subproc_number < config_.parallelism
-    && ((subprocs_.running_.empty() || config_.max_load_average <= 0.0f)
-        || GetLoadAverage() < config_.max_load_average);
+
+  int64_t capacity = config_.parallelism - subproc_number;
+
+  if (config_.max_load_average > 0.0f) {
+    int load_capacity = config_.max_load_average - GetLoadAverage();
+    if (load_capacity < capacity)
+      capacity = load_capacity;
+  }
+
+  if (capacity < 0)
+    capacity = 0;
+
+  if (capacity == 0 && subprocs_.running_.empty())
+    // Ensure that we make progress.
+    capacity = 1;
+
+  return capacity;
 }
 
 bool RealCommandRunner::StartCommand(Edge* edge) {
@@ -611,6 +741,7 @@ bool Builder::AlreadyUpToDate() const {
 
 bool Builder::Build(string* err) {
   assert(!AlreadyUpToDate());
+  plan_.PrepareQueue();
 
   status_->PlanHasTotalEdges(plan_.command_edge_count());
   int pending_commands = 0;
@@ -634,8 +765,13 @@ bool Builder::Build(string* err) {
   // Second, we attempt to wait for / reap the next finished command.
   while (plan_.more_to_do()) {
     // See if we can start any more commands.
-    if (failures_allowed && command_runner_->CanRunMore()) {
-      if (Edge* edge = plan_.FindWork()) {
+    if (failures_allowed) {
+      size_t capacity = command_runner_->CanRunMore();
+      while (capacity > 0) {
+        Edge* edge = plan_.FindWork();
+        if (!edge)
+          break;
+
         if (edge->GetBindingBool("generator")) {
           scan_.build_log()->Close();
         }
@@ -654,11 +790,19 @@ bool Builder::Build(string* err) {
           }
         } else {
           ++pending_commands;
-        }
 
-        // We made some progress; go back to the main loop.
-        continue;
+          --capacity;
+
+          // Re-evaluate capacity.
+          size_t current_capacity = command_runner_->CanRunMore();
+          if (current_capacity < capacity)
+            capacity = current_capacity;
+        }
       }
+
+       // We are finished with all work items and have no pending
+       // commands. Therefore, break out of the main loop.
+       if (pending_commands == 0 && !plan_.more_to_do()) break;
     }
 
     // See if we can reap any finished commands.
