@@ -104,26 +104,34 @@ jobs:
 
       - name: Upload release asset
         if: github.event.action == 'published'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ncipollo/release-action@v1
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./artifact/ninja-linux${{ matrix.arch }}.zip
-          asset_name: ninja-linux${{ matrix.arch }}.zip
-          asset_content_type: application/zip
+          allowUpdates: true # if release exists it will edit it.
+          artifactContentType: "application/zip" # if empty defaults to raw
+          replacesArtifacts: true # will update existing release assets if needed.
+          omitBodyDuringUpdate: true # don't edit release body when published via webui
+          artifacts: ./artifact/ninja-linux${{ matrix.arch }}.zip # release asset
 
   test:
-    runs-on: [ubuntu-latest]
-    container:
-      image: ubuntu:20.04
+    permissions: # https://docs.zizmor.sh/audits/#excessive-permissions
+      contents: read
+    strategy:
+      matrix:
+        host-os: ["ubuntu-latest", "ubuntu-24.04-arm"]
+        image: ["ubuntu:22.04", "ubuntu:24.04"]
+      fail-fast: false
+    defaults:
+      run:
+        shell: bash
+    runs-on: ${{ matrix.host-os }}
+    container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           apt update
-          apt install -y python3-pytest ninja-build python3-pip clang libgtest-dev
-          pip3 install cmake==3.17.*
+          apt install -y cmake python3-pytest ninja-build python3-pip clang libgtest-dev
+
       - name: Configure (GCC)
         run: cmake -Bbuild-gcc -DCMAKE_BUILD_TYPE=Debug -G'Ninja Multi-Config'
 
