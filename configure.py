@@ -332,6 +332,7 @@ if platform.is_msvc():
     cflags = ['/showIncludes',
               '/nologo',  # Don't print startup banner.
               '/utf-8',
+              '/std:c++17',
               '/Zi',  # Create pdb with debug info.
               '/W4',  # Highest warning level.
               '/WX',  # Warnings as errors.
@@ -383,7 +384,7 @@ else:
             stdout=open(os.devnull, 'wb'), stderr=subprocess.STDOUT)
         if proc.wait() == 0:
             cflags += ['-fdiagnostics-color']
-    except:
+    except Exception:
         pass
     if platform.is_mingw():
         cflags += ['-D_WIN32_WINNT=0x0601', '-D__USE_MINGW_ANSI_STDIO=1']
