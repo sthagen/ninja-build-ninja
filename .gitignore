@@ -4,7 +4,7 @@
 *.pdb
 *.ilk
 /build*/
-/build.ninja
+/build*.ninja
 /ninja
 /ninja.bootstrap
 /build_log_perftest

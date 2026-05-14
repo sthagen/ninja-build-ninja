@@ -7,6 +7,7 @@ In order to simulate a smart terminal it uses the 'script' command.
 
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -385,6 +386,18 @@ ninja: build stopped: subcommand failed.
         output = run(Output.BUILD_SIMPLE_ECHO, flags='--quiet')
         self.assertEqual(output, 'do thing\n')
 
+    def test_status_flag(self) -> None:
+        'Does --status accept a Ninja-style $-format?'
+        output = run(Output.BUILD_SIMPLE_ECHO,
+                     flags="--status '<${finished}/${total}> '")
+        self.assertEqual(output, '<1/1> echo a\x1b[K\ndo thing\n')
+
+    def test_status_flag_unknown_variable(self) -> None:
+        'Does --status fail clearly on an unknown variable?'
+        self._test_expected_error(
+            Output.BUILD_SIMPLE_ECHO, "--status '$nope '",
+            "ninja: fatal: unknown variable 'nope' in --status format\n")
+
     def test_entering_directory_on_stdout(self) -> None:
         output = run(Output.BUILD_SIMPLE_ECHO, flags='-C$PWD', pipe=True)
         self.assertEqual(output.splitlines()[0][:25], "ninja: Entering directory")
@@ -664,13 +677,22 @@ build stamp-1: touch || dd-1
 build stamp-2: touch || dd-2
   n = 2
 """
-        self._test_expected_error(
-            plan,
-            "-v",
-            r"""[1/4] printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1
-[2/4] printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2
-ninja: build stopped: multiple rules generate out.
-""",
+        # The two dd-N printfs run in parallel and may finish in either
+        # order, so compare the leading status lines as a set with the
+        # [N/4] progress prefix stripped.
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            run(plan, "-v", print_err_output=False)
+        actual_lines = cm.exception.cooked_output.splitlines()
+        self.assertEqual(len(actual_lines), 3)
+        self.assertEqual(
+            {re.sub(r"^\[\d+/4\] ", "", line) for line in actual_lines[:2]},
+            {
+                r"printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1",
+                r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2",
+            },
+        )
+        self.assertEqual(
+            actual_lines[2], "ninja: build stopped: multiple rules generate out."
         )
 
     def test_issue_2681(self):

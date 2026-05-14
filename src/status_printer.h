@@ -14,8 +14,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <queue>
 
+#include "eval_env.h"
 #include "exit_status.h"
 #include "explanations.h"
 #include "line_printer.h"
@@ -49,6 +51,11 @@ struct StatusPrinter : Status {
   /// @param status The status of the edge.
   std::string FormatProgressStatus(const char* progress_status_format,
                                    int64_t time_millis) const;
+
+  /// Look up the value of a named status variable (used by `--status`,
+  /// which evaluates a Ninja-style format string). Calls Fatal on an
+  /// unknown name.
+  std::string FormatStatusVariable(const std::string& name) const;
 
   /// Set the |explanations_| pointer. Used to implement `-d explain`.
   void SetExplanations(Explanations* explanations) override {
@@ -92,8 +99,13 @@ struct StatusPrinter : Status {
   /// An optional Explanations pointer, used to implement `-d explain`.
   Explanations* explanations_ = nullptr;
 
-  /// The custom progress status format to use.
+  /// The custom progress status format to use (NINJA_STATUS or default).
+  /// Null when `--status` is in effect; in that case `status_eval_` is used.
   const char* progress_status_format_;
+
+  /// Parsed `--status` format, evaluated against status variables on each
+  /// update. Null when `--status` was not supplied.
+  std::unique_ptr<EvalString> status_eval_;
 
   template <size_t S>
   void SnprintfRate(double rate, char (&buf)[S], const char* format) const {

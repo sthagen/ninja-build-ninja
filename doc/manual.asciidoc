@@ -248,6 +248,30 @@ The default progress status is `"[%f/%t] "` (note the trailing space
 to separate from the build rule). Another example of possible progress status
 could be `"[%u/%r/%f] "`.
 
+The `--status FMT` command-line flag also configures the progress status,
+but uses Ninja's regular variable-expansion syntax (`$var` or `${var}`)
+instead of `%`-escapes, with descriptive variable names. When passed,
+it takes precedence over `NINJA_STATUS`.
+
+The available variables and their `NINJA_STATUS` equivalents are:
+
+`$started`:: `%s` -- The number of started edges.
+`$total`:: `%t` -- The total number of edges.
+`$progress`:: `%p` -- The percentage of finished edges.
+`$running`:: `%r` -- The number of currently running edges.
+`$remaining`:: `%u` -- The number of remaining edges to start.
+`$finished`:: `%f` -- The number of finished edges.
+`$rate`:: `%o` -- Overall rate of finished edges per second.
+`$current_rate`:: `%c` -- Current rate of finished edges per second.
+`$elapsed_seconds`:: `%e` -- Elapsed time in seconds.
+`$eta_seconds`:: `%E` -- Remaining time (ETA) in seconds.
+`$elapsed`:: `%w` -- Elapsed time in [h:]mm:ss format.
+`$eta`:: `%W` -- Remaining time (ETA) in [h:]mm:ss format.
+`$predicted_progress`:: `%P` -- Percentage (in `ppp%` format) of time elapsed
+out of predicted total runtime.
+
+To produce a literal `$`, use `$$`. The `--status` flag was added in Ninja 1.14.
+
 If `MAKEFLAGS` is defined in the environment, if may alter how
 Ninja dispatches parallel build commands. See the GNU Jobserver support
 section for details.

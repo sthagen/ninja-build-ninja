@@ -34,8 +34,22 @@
 #include "build.h"
 #include "debug_flags.h"
 #include "exit_status.h"
+#include "lexer.h"
+#include "util.h"
 
 using namespace std;
+
+namespace {
+/// Env that resolves variables in a `--status` format string by asking
+/// the StatusPrinter for their current value.
+struct StatusFormatEnv : public Env {
+  const StatusPrinter* printer;
+  explicit StatusFormatEnv(const StatusPrinter* p) : printer(p) {}
+  string LookupVariable(const string& var) override {
+    return printer->FormatStatusVariable(var);
+  }
+};
+}  // namespace
 
 Status* Status::factory(const BuildConfig& config) {
   return new StatusPrinter(config);
@@ -49,9 +63,22 @@ StatusPrinter::StatusPrinter(const BuildConfig& config)
   if (config_.verbosity != BuildConfig::NORMAL)
     printer_.set_smart_terminal(false);
 
-  progress_status_format_ = getenv("NINJA_STATUS");
-  if (!progress_status_format_)
-    progress_status_format_ = "[%f/%t] ";
+  if (config.progress_status_format) {
+    // --status uses Ninja-style variable expansion ($var / ${var}).
+    // Append a newline because Lexer::ReadVarValue terminates on \n.
+    string input = string(config.progress_status_format) + "\n";
+    Lexer lexer;
+    lexer.Start("--status", input);
+    status_eval_.reset(new EvalString());
+    string err;
+    if (!lexer.ReadVarValue(status_eval_.get(), &err))
+      Fatal("invalid --status: %s", err.c_str());
+    progress_status_format_ = NULL;
+  } else {
+    progress_status_format_ = getenv("NINJA_STATUS");
+    if (!progress_status_format_)
+      progress_status_format_ = "[%f/%t] ";
+  }
 }
 
 void StatusPrinter::EdgeAddedToPlan(const Edge* edge) {
@@ -405,6 +432,79 @@ string StatusPrinter::FormatProgressStatus(const char* progress_status_format,
   return out;
 }
 
+string StatusPrinter::FormatStatusVariable(const string& name) const {
+  char buf[32];
+
+  if (name == "started") {
+    snprintf(buf, sizeof(buf), "%d", started_edges_);
+    return buf;
+  }
+  if (name == "total") {
+    snprintf(buf, sizeof(buf), "%d", total_edges_);
+    return buf;
+  }
+  if (name == "running") {
+    snprintf(buf, sizeof(buf), "%d", running_edges_);
+    return buf;
+  }
+  if (name == "remaining") {
+    snprintf(buf, sizeof(buf), "%d", total_edges_ - started_edges_);
+    return buf;
+  }
+  if (name == "finished") {
+    snprintf(buf, sizeof(buf), "%d", finished_edges_);
+    return buf;
+  }
+  if (name == "rate") {
+    SnprintfRate(finished_edges_ / (time_millis_ / 1e3), buf, "%.1f");
+    return buf;
+  }
+  if (name == "current_rate") {
+    current_rate_.UpdateRate(finished_edges_, time_millis_);
+    SnprintfRate(current_rate_.rate(), buf, "%.1f");
+    return buf;
+  }
+  if (name == "progress") {
+    int percent = 0;
+    if (finished_edges_ != 0 && total_edges_ != 0)
+      percent = (100 * finished_edges_) / total_edges_;
+    snprintf(buf, sizeof(buf), "%3i%%", percent);
+    return buf;
+  }
+  if (name == "predicted_progress") {
+    snprintf(buf, sizeof(buf), "%3i%%",
+             (int)(100. * time_predicted_percentage_));
+    return buf;
+  }
+
+  if (name == "elapsed" || name == "elapsed_seconds" ||
+      name == "eta" || name == "eta_seconds") {
+    double elapsed_sec = time_millis_ / 1e3;
+    double eta_sec = -1;
+    if (time_predicted_percentage_ != 0.0) {
+      double total_wall_time = time_millis_ / time_predicted_percentage_;
+      eta_sec = (total_wall_time - time_millis_) / 1e3;
+    }
+    const bool print_with_hours =
+        elapsed_sec >= 60 * 60 || eta_sec >= 60 * 60;
+    const bool is_eta = (name == "eta" || name == "eta_seconds");
+    double sec = is_eta ? eta_sec : elapsed_sec;
+    if (sec < 0)
+      return "?";
+    if (name == "elapsed_seconds" || name == "eta_seconds") {
+      snprintf(buf, sizeof(buf), "%.3f", sec);
+    } else if (print_with_hours) {
+      snprintf(buf, sizeof(buf), FORMAT_TIME_HMMSS((int64_t)sec));
+    } else {
+      snprintf(buf, sizeof(buf), FORMAT_TIME_MMSS((int64_t)sec));
+    }
+    return buf;
+  }
+
+  Fatal("unknown variable '%s' in --status format", name.c_str());
+  return "";
+}
+
 void StatusPrinter::PrintStatus(const Edge* edge, int64_t time_millis) {
   if (explanations_) {
     explanations_->ExplainEdge(edge);
@@ -422,8 +522,13 @@ void StatusPrinter::PrintStatus(const Edge* edge, int64_t time_millis) {
   if (to_print.empty() || force_full_command)
     to_print = edge->GetBinding("command");
 
-  to_print = FormatProgressStatus(progress_status_format_, time_millis)
-      + to_print;
+  if (status_eval_) {
+    StatusFormatEnv env(this);
+    to_print = status_eval_->Evaluate(&env) + to_print;
+  } else {
+    to_print = FormatProgressStatus(progress_status_format_, time_millis)
+        + to_print;
+  }
 
   printer_.Print(to_print,
                  force_full_command ? LinePrinter::FULL : LinePrinter::ELIDE);
